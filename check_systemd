@@ -1,0 +1,267 @@
+#!/usr/bin/perl -w
+
+
+
+
+# CHANGE LOG
+# ----------
+#  2022-05-10	njeffrey	Script created
+
+
+
+# nagios check to verify status of Linux systemd units (services, mounts, etc)
+#
+
+# CONFIGURATION
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.  
+#
+#  If you hare using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#  # Define service for checking RHEL subscription status
+#  define service{
+#     use                             generic-service
+#     host_name                       linux01
+#     service_description             systemd dhcpd.service
+#     check_command                   check_by_ssh!/usr/local/nagios/libexec/check_systemd!dhcpd.service
+#     }
+#
+#  Alternatively, if you are using the NRPE method, you should have a section similar to the following in 
+#  the services.cfg file:
+#  define service{
+#     use                             generic-service
+#     host_name                       linux01
+#     service_description             systemd dhcpd.service
+#     check_command                   check_nrpe!check_systemd
+#     }
+#
+#  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
+#  in the /usr/local/nagios/nrpe/nrpe.cfg file:
+#      command[check_systemd]=/usr/local/nagios/libexec/check_systemd $ARG1$
+
+
+
+
+# TROUBLESHOOTING
+# ---------------
+#
+
+
+
+
+use strict;						#enforce good coding practices
+use Getopt::Long;                       		#allow --long-switches to be used as parameters
+
+
+# Declare variables
+my ($cmd,$systemctl,$systemd_unit,$systemd_unit_description,$systemd_unit_status);
+my ($output_message,$common_output_data,$perf_data,$verbose);
+my ($opt_h,$opt_v,$opt_u);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+$systemctl  = "/bin/systemctl";					#location of systemctl backup
+$verbose    = "no";						#yes|no flag to increase verbosity for debugging
+$CHECK_NAME = "systemd";
+#
+# Nagios return codes
+#
+$OK=		0;
+$WARN=		1;
+$CRITICAL=	2;
+$UNKNOWN=	3;
+
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "Running get_options subroutine \n" if ($verbose eq "yes");
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"    => \$opt_h,
+      "v"   => \$opt_v, "verbose" => \$opt_v,
+      "u=s" => \$opt_u, "unit=s"  => \$opt_u,  "systemd_unit=s"     => \$opt_u,
+   );
+   #
+   # If the user supplied the -h or --help switch, give them some help.
+   #
+   if( defined( $opt_h ) ) {
+      print "Use this syntax \n";
+      print "   $0 \n";
+      print "   $0 --verbose     (increase output for debugging \n";
+      print "   $0 --warn=#      (# of days to warn     before subscription expiry \n";
+      print "   $0 --crit=#      (# of days to critical before subscription expiry \n";
+      exit $CRITICAL;				#exit script
+   }
+   #
+   # Confirm the user provided the  --unit=blah.service
+   #
+   if( defined( $opt_u ) ) {
+      $systemd_unit = $opt_u;
+      $CHECK_NAME   = "$CHECK_NAME $systemd_unit"; #append the name of the systemd unit to the nagios check name
+   } else {
+      print "   Please provide systemd unit to check: $0 --unit=blah.service \n";
+      exit $CRITICAL;				#exit script
+   }
+   #
+   # If the user supplied the --verbose switch, increase output verbosity
+   #
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } else {
+      $verbose = "no";
+   }
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   print "Running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm /bin/systemctl exists 
+   if ( ! -e $systemctl ) {
+      print "ERROR: Cannot find $systemctl \n";
+      exit $CRITICAL;
+   }
+   #
+   # confirm /bin/systemctl file is executable
+   if ( ! -x $systemctl ) {
+      print "ERROR: $systemctl is not executable by the current user \n";
+      exit $CRITICAL;
+   }
+}						#end of subroutine
+
+
+
+
+
+
+
+
+
+
+sub get_status {
+   #
+   print "running get_status subroutine \n" if ($verbose eq "yes");
+   #
+   # Output of command will be similar to the following: 
+   #
+   # $ systemctl list-units dhcpd.service
+   # UNIT          LOAD   ACTIVE SUB     DESCRIPTION
+   # dhcpd.service loaded active running DHCPv4 Server Daemon
+   #
+   # $ systemctl status dhcpd.service
+   # dhcpd.service - DHCPv4 Server Daemon
+   #   Loaded: loaded (/usr/lib/systemd/system/dhcpd.service; enabled; vendor preset: disabled)
+   #   Active: active (running) since Tue 2022-04-19 12:19:35 MDT; 3 weeks 0 days ago             <--- example of an active   (running) service
+   #   Active: inactive (dead) since Tue 2022-05-10 14:22:10 MDT; 1s ago                          <--- example of an inactive (stopped) service
+   #
+   #     Docs: man:dhcpd(8)
+   #           man:dhcpd.conf(5)
+   # Main PID: 1082 (dhcpd)
+   #   Status: "Dispatching packets..."
+   #   CGroup: /system.slice/dhcpd.service
+   #           └─1082 /usr/sbin/dhcpd -f -cf /etc/dhcp/dhcpd.conf -user dhcpd -group dhcpd --no-pid
+   #
+   #
+   # parse out the description of the systemd unit so we can put the description in the output
+   #
+   $systemd_unit_description = "unknown";			#initialize variable
+   $systemd_unit_status      = "unknown";			#initialize variable
+   $cmd = "$systemctl list-units $systemd_unit";  
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd 2>&1|");	#open filehandle
+   while (<IN>) {						#read a line from the filehandle  
+      next if (/^UNIT/);					#skip header line
+      if ( /\w\s\w\s\w\s\w\s([a-zA-Z0-9_ \\\/\.\-]+)/ ) {		#parse out the DESCRIPTION column in the command output
+         $systemd_unit_description = $1;			#assign value to variable
+	 print "   found unit description: $systemd_unit_description \n" if ($verbose eq "yes");
+      }
+   }								#end of while loop
+   close IN;							#close filehandle
+   #
+   #
+   # parse out the stopped|started status of the systemd unit 
+   #
+   $cmd = "$systemctl status $systemd_unit";  
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd 2>&1|");	#open filehandle
+   while (<IN>) {						#read a line from the filehandle  
+      if ( /$systemd_unit \- ([a-zA-Z0-9_ \\\/\.\-]+)/ ) {		#parse out the DESCRIPTION of the systemd unit
+         $systemd_unit_description = $1;			#assign value to variable
+	 print "   found unit description: $systemd_unit_description \n" if ($verbose eq "yes");
+      }
+      if ( /Active: ([a-z]+)/ ) {				#parse out the active|inactive status of the systemd unit
+         $systemd_unit_status = $1;				#assign value to variable
+	 print "   found unit status: $systemd_unit_status \n" if ($verbose eq "yes");
+      }
+      if ( /Unit $systemd_unit could not be found/ ) {		#error message if the user provided an invalid systemd unit name
+         $systemd_unit_status = "could not be found";		#assign value to variable
+	 print "   found unit status: $systemd_unit_status \n" if ($verbose eq "yes");
+      }
+   }								#end of while loop
+}                                               		#end of subroutine
+
+
+
+
+
+
+
+
+
+sub print_output {
+   #
+   print "Running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   $common_output_data = "systemd unit $systemd_unit ($systemd_unit_description) status is $systemd_unit_status";
+   $perf_data = "";
+   #
+   if ( $systemd_unit_status eq "could not be found" ) {
+      $output_message = "$CHECK_NAME UNKNOWN - the systemd unit $systemd_unit could not be found.  Please confirm this is a valid systemd unit name. | $perf_data \n";
+      print $output_message;
+      exit $UNKNOWN;
+   }
+   #
+   if ( $systemd_unit_description eq "unknown" ) {
+      $output_message = "$CHECK_NAME UNKNOWN - cannot determine description of $common_output_data | $perf_data \n";
+      print $output_message;
+      exit $UNKNOWN;
+   }
+   #
+   if ( $systemd_unit_status eq "unknown" ) {
+      $output_message = "$CHECK_NAME UNKNOWN - cannot determine status of $common_output_data | $perf_data \n";
+      print $output_message;
+      exit $UNKNOWN;
+   }
+   #
+   if ( $systemd_unit_status ne "active" ) {
+      $output_message = "$CHECK_NAME CRITICAL - $common_output_data | $perf_data \n";
+      print $output_message;
+      exit $CRITICAL;
+   }
+   #
+   if ( $systemd_unit_status eq "active" ) {
+      $output_message = "$CHECK_NAME OK - $common_output_data | $perf_data \n";
+      print $output_message;
+      exit $OK;
+   }
+}			#end of subroutine
+
+
+
+
+# ---------------- main body of script -------------------------
+get_options;
+sanity_checks;
+get_status;
+print_output;
+
+
